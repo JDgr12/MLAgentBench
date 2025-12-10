@@ -21,6 +21,7 @@ from .high_level_actions import HIGH_LEVEL_ACTIONS
 from .schema import Step, Trace, EnvException, TooLongPromptError, LLMError, EnhancedJSONEncoder 
 from .LLM import complete_text_claude
 from .prepare_task import prepare_task, get_task_info
+from codecarbon import EmissionsTracker
 
 class TimeoutException(Exception): pass
 
@@ -47,6 +48,8 @@ class Environment:
         self._args = args
         self._log_dir = os.path.join(args.log_dir, "env_log")
         self._setup_log_dir()
+        self._codecarbon_dir = os.path.join(self.log_dir, "codecarbon")
+        os.makedirs(self._codecarbon_dir, exist_ok=True)
 
         if not args.interactive:
             self._benchmark_folder_name, self._research_problem = get_task_info(args.task)
@@ -281,9 +284,53 @@ class Environment:
         any_final_answer = any([s.action.name == "Final Answer" for s in self.trace.steps])
         return curr_step >= self.args.max_steps or any_final_answer or time.time() - self.start_time > self.args.max_time
 
+    def _execute_action(self, action, curr_step, trace):
+        action_name = action.name
+        action_input = action.args
+
+        log_file = os.path.join(self.log_dir, "tool_logs", f"step_{curr_step}_tool_log.log")
+        usage = ",\n            ".join([f"{k}: [{v}]" for k, v in self.action_infos[action_name].usage.items()])
+        usage = f"""{{
+                {usage}
+}}"""
+        invalid_action_error = (
+            f"The action input for {action_name} needs to be a valid json with proper entries. "
+            f"You may have missed the comma between entries. Please use the correct format and try again:\n{usage}"
+    )
+
+        if isinstance(action_input, dict):
+            try:
+                return self.action_infos[action_name].function(
+                    **action_input,
+                    log_file=log_file,
+                    trace=trace,
+                    **self.static_kwargs_for_tools,
+                )
+            except TooLongPromptError:
+                return "EnvError: too long input for the tool"
+            except LLMError as e:
+                return "LLMError: " + e.message
+            except EnvException as e:
+                return "EnvError: " + e.message
+            except TypeError as e:
+                print("Step: ", curr_step, file=sys.stderr)
+                print(e, file=sys.stderr)
+                print(action_input, file=sys.stderr)
+                return "EnvError: " + invalid_action_error
+            except TimeoutException as e:
+                raise e
+            except Exception as e:
+                print("Step: ", curr_step, file=sys.stderr)
+                print(e, file=sys.stderr)
+                if "Connection aborted." in str(e):
+                    raise Exception("Connection aborted for crfm")
+                return f"EnvError: Error executing {action_name}."
+        else:
+            return invalid_action_error
+
     def execute(self, action):
         """Execute an action and return the observation."""
-        
+
         trace = self._trace
 
         curr_step = len(trace.steps)
@@ -294,47 +341,42 @@ class Environment:
             observation = "end"
 
         elif self.is_final():
-            observation = "The environment has shut down because the maximum number of steps or time has been reached. Please submit your final answer."
+            observation = (
+                "The environment has shut down because the maximum number of steps or time has been reached. "
+                "Please submit your final answer."
+        )
 
         elif action_name not in list(self.action_infos.keys()):
             actions = ", ".join(self.action_infos.keys())
             observation = f"Invalid action: {action_name}. Action did not execute. Please use one of the following actions:\n{actions}"
 
         else:
-            # execute the action and get the observation
-            log_file = os.path.join(os.path.join(self.log_dir, "tool_logs") , f"step_{curr_step}_tool_log.log")
-            usage = ",\n            ".join([f"{k}: [{v}]" for k, v in self.action_infos[action_name].usage.items()])
-            usage = f"""{{
-            {usage}
-}}"""
-            invalid_action_error = f"The action input for {action_name} needs to be a valid json with proper entries. You may have missed the comma between entries. Please use the correct format and try again:\n{usage}"
+            # Actions that want to be measure by Codecarbone (Ajdust as needed)
+            HEAVY_ACTIONS = {"Execute Script", "Python REPL", "List Files", "Inspect Script Lines", "Understand FIle", "Edit Script (AI)", "Edit Script Segments (AI)"}
 
-            if isinstance(action_input, dict):
+            if action_name in HEAVY_ACTIONS:
+                out_file = f"step_{curr_step:04d}_{action_name.replace(' ', '_')}.csv"
+                gpu_ids = [self.args.device] if isinstance(self.args.device, int) else None
+
+                tracker = EmissionsTracker(
+                    project_name=f"{self.benchmark_folder_name}-{action_name}",
+                    output_dir=self._codecarbon_dir,
+                    output_file=out_file,
+                    measure_power_secs=1,   # 1–5 s recomendado
+                    save_to_file=True,
+                    log_level="error",
+                    gpu_ids=gpu_ids,
+                    #offline = true,  # descomentar si no hay conexión a internet
+                    #country_iso_code="ITA",  # ajustar según sea necesario
+                )
+                tracker.start()
                 try:
-                    observation = self.action_infos[action_name].function(**action_input, log_file=log_file, trace=trace, **self.static_kwargs_for_tools)
-                except TooLongPromptError:
-                    observation="EnvError: too long input for the tool"
-                except LLMError as e:
-                    observation = "LLMError: " + e.message
-                except EnvException as e:
-                    observation = "EnvError: " + e.message
-                except TypeError as e:
-                    print("Step: ", curr_step, file=sys.stderr)
-                    print(e, file=sys.stderr)
-                    print(action_input, file=sys.stderr)
-                    observation = "EnvError: " + invalid_action_error
-                except TimeoutException as e:
-                    raise e
-                except Exception as e:
-                    # should not happen
-                    print("Step: ", curr_step, file=sys.stderr)
-                    print(e, file=sys.stderr)
-                    if "Connection aborted." in str(e):
-                        raise Exception("Connection aborted for crfm")
-                    observation = f"EnvError: Error executing {action_name}."
+                    observation = self._execute_action(action, curr_step, trace)
+                finally:
+                    tracker.stop()
             else:
-                observation = invalid_action_error
-
+                # Acciones ligeras: sin medición
+                observation = self._execute_action(action, curr_step, trace)
 
         step_time = time.time()
 
@@ -342,6 +384,7 @@ class Environment:
 
         self.save(curr_step)
         return observation
+
 
     def save(self, curr_step):
         """ Save the trace and snapshot of the workspace folder """     
