@@ -5,6 +5,7 @@ import anthropic
 from MLAgentBench.LLM import complete_text_fast, complete_text
 from MLAgentBench.schema import Action
 from .agent import Agent
+from codecarbon import EmissionsTracker
 
 initial_prompt = """You are a helpful research assistant. You have access to the following tools:
 {tools_prompt}
@@ -108,9 +109,29 @@ class ResearchAgent(Agent):
 
             entries = None
             valid_response = False
-            for _ in range(self.args.max_retries):
+            for attempt in range(self.args.max_retries):
                 log_file = os.path.join(self.log_dir , f"step_{curr_step}_log.log")
-                completion = complete_text(prompt, log_file, self.args.llm_name)
+                #completion = complete_text(prompt, log_file, self.args.llm_name)
+
+                # -----------CodeCarbon alrededor de la llamada al LLM -----------)
+                cc_dir = os.path.join(self.args.log_dir, "codecarbon")
+                os.makedirs(cc_dir, exist_ok=True)
+                tracker = EmissionsTracker(
+                    project_name=f"{self.args.task}-llm",
+                    output_dir=cc_dir,
+                    output_file=f"step_{curr_step:04d}_LLM_attempt_{attempt+1}.csv",
+                    measure_power_secs=1,     # 1–5 s recomendado
+                    save_to_file=True,
+                    log_level="error",
+                    #offline= True,  # descomentar si no hay conexión a internet
+                    #country_iso_code="ITA",  # ajustar según sea necesario
+                    gpu_ids=[self.args.device] if isinstance(self.args.device, int) else None
+                )
+                tracker.start()
+                try:
+                    completion = complete_text(prompt, log_file, self.args.llm_name)
+                finally:   
+                    tracker.stop()
 
                 try:
                     entries = self.parse_entries(completion, self.valid_format_entires)
@@ -286,4 +307,3 @@ Do not include any result that is guessed rather than directly confirmed by the 
 
         summary = "[Reasoning]:" + complete_text_fast(prompt, log_file=kwargs["log_file"]).split("[Reasoning]:")[1]
         return summary
-    
