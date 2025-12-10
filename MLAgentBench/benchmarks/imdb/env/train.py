@@ -3,7 +3,7 @@ import torch
 import pandas as pd
 
 if __name__ == "__main__":
-    imdb = load_dataset("imdb")
+    imdb = load_dataset("stanfordnlp/imdb")
 
     #TODO: preprocess data
 
