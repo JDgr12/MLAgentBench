@@ -1,0 +1,8 @@
+# Librerias extra
+fastapi
+uvicorn
+gigachain-anthropic
+codecarbon>=2.2.3
+psutil>=5.9
+pandas
+matplotlib
